@@ -32,6 +32,10 @@ DEBUG_PORT = int(os.environ.get("KNIME_DEBUG_PORT", "9222"))
 NS = "{http://www.knime.org/2008/09/XMLConfig}"
 RPC_ACTION = "org.knime.ui.java.jsonrpc"
 CURRENT = "current-state"
+RPC_TIMEOUT_SECONDS = 30
+STORE_SYNC_SECONDS = 0.4
+APP = "document.querySelector('#app').__vue_app__.config.globalProperties"
+ACTIVE = f"{APP}.$pinia.state.value.workflow.activeWorkflow"
 BUSY_STATES = {"QUEUED", "EXECUTING"}
 
 mcp = FastMCP("knime")
@@ -159,13 +163,14 @@ class Gateway:
             "method": "Runtime.evaluate",
             "params": {"expression": expression, "awaitPromise": True, "returnByValue": True},
         }))
-        while True:
-            message = json.loads(await self.socket.recv())
-            if message.get("id") == message_id:
-                result = message["result"]
-                if "exceptionDetails" in result:
-                    raise RuntimeError(str(result["exceptionDetails"])[:500])
-                return result["result"].get("value")
+        async with asyncio.timeout(RPC_TIMEOUT_SECONDS):
+            while True:
+                message = json.loads(await self.socket.recv())
+                if message.get("id") == message_id:
+                    result = message["result"]
+                    if "exceptionDetails" in result:
+                        raise RuntimeError(str(result["exceptionDetails"])[:500])
+                    return result["result"].get("value")
 
     async def call(self, method: str, **params):
         body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
@@ -178,7 +183,12 @@ class Gateway:
         return response.get("result")
 
     async def project(self, project_id: str | None) -> str:
-        """Return the given project, or the only open one."""
+        """Return the given project, or the only open one, and show it in the UI."""
+        project = await self.resolve_project(project_id)
+        await self.show(project)
+        return project
+
+    async def resolve_project(self, project_id: str | None) -> str:
         if project_id:
             return project_id
         state = await self.call("ApplicationService.getState")
@@ -192,7 +202,28 @@ class Gateway:
             [{"project_id": p["projectId"], "name": p["name"]} for p in projects]
         ))
 
+    async def show(self, project: str):
+        """Make the project the active tab, so the UI store tracks it."""
+        target = json.dumps(project)
+        await self.evaluate(
+            f"{ACTIVE}?.projectId === {target} ? null : {APP}.$router.push("
+            f"{{name: 'WorkflowPage', params: {{projectId: {target}, workflowId: 'root'}}}})"
+            ".then(() => null)"
+        )
+        for _ in range(40):
+            if await self.evaluate(f"{ACTIVE}?.projectId") == project:
+                return
+            await asyncio.sleep(0.25)
+        raise RuntimeError(f"Project {project} did not become active")
+
     async def workflow(self, project_id: str, workflow_id: str) -> dict:
+        """Read a workflow.
+
+        The root comes from the UI store. Repeated getWorkflow calls evict the
+        snapshot that the UI follows, which makes workflow commands hang.
+        """
+        if workflow_id == "root":
+            return json.loads(await self.evaluate(f"JSON.stringify({ACTIVE})"))
         result = await self.call(
             "WorkflowService.getWorkflow", projectId=project_id, workflowId=workflow_id,
             versionId=CURRENT, includeInteractionInfo=True,
@@ -200,10 +231,12 @@ class Gateway:
         return result["workflow"]
 
     async def command(self, project_id: str, workflow_id: str, **workflow_command):
-        return await self.call(
+        result = await self.call(
             "WorkflowService.executeWorkflowCommand", projectId=project_id,
             workflowId=workflow_id, workflowCommand=workflow_command,
         )
+        await asyncio.sleep(STORE_SYNC_SECONDS)
+        return result
 
 
 def merge(base: dict, patch: dict) -> dict:
@@ -446,7 +479,7 @@ async def change_states(project_id, workflow_id, node_ids, action, timeout_secon
         )
         deadline = time.monotonic() + timeout_seconds
         while True:
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.5 if workflow_id == "root" else 3)
             states = node_states(await gateway.workflow(project, workflow_id))
             busy = [i for i, s in states.items() if s.get("state") in BUSY_STATES]
             if not busy:
