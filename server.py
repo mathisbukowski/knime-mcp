@@ -29,7 +29,8 @@ from mcp.server.fastmcp import FastMCP
 
 WORKSPACE = Path(os.environ.get("KNIME_WORKSPACE", "~/knime-workspace")).expanduser().resolve()
 DEBUG_PORT = int(os.environ.get("KNIME_DEBUG_PORT", "9222"))
-NS = "{http://www.knime.org/2008/09/XMLConfig}"
+XML_URI = "http://www.knime.org/2008/09/XMLConfig"
+NS = f"{{{XML_URI}}}"
 RPC_ACTION = "org.knime.ui.java.jsonrpc"
 CURRENT = "current-state"
 RPC_TIMEOUT_SECONDS = 30
@@ -37,6 +38,9 @@ STORE_SYNC_SECONDS = 0.4
 APP = "document.querySelector('#app').__vue_app__.config.globalProperties"
 ACTIVE = f"{APP}.$pinia.state.value.workflow.activeWorkflow"
 BUSY_STATES = {"QUEUED", "EXECUTING"}
+
+ET.register_namespace("", XML_URI)
+ET.register_namespace("xsi", "http://www.w3.org/2001/XMLSchema-instance")
 
 mcp = FastMCP("knime")
 
@@ -281,7 +285,7 @@ async def require_web_dialog(gateway: Gateway, project: str, workflow_id: str, n
     if node.get("dialogType") != "web":
         raise ValueError(
             f"Node {node_id} has dialog type {node.get('dialogType')!r}. "
-            "Only web dialogs can be read or changed. Configure this node in KNIME."
+            "Use live_get_node_settings and live_set_node_settings instead."
         )
 
 
@@ -488,6 +492,198 @@ async def change_states(project_id, workflow_id, node_ids, action, timeout_secon
                 return {"finished": False, "still_running": busy, "nodes": states}
 
 
+def xml_entry(key: str, value, entry_type: str | None = None) -> ET.Element:
+    """Build a config entry, inferring its type unless one is given."""
+    if entry_type is None:
+        if isinstance(value, bool):
+            entry_type = "xboolean"
+        elif isinstance(value, int):
+            entry_type = "xint" if -(2**31) <= value < 2**31 else "xlong"
+        elif isinstance(value, float):
+            entry_type = "xdouble"
+        else:
+            entry_type = "xstring"
+    entry = ET.Element(f"{NS}entry", {"key": key, "type": entry_type})
+    if value is None:
+        entry.set("isnull", "true")
+        entry.set("value", "")
+    elif isinstance(value, bool):
+        entry.set("value", "true" if value else "false")
+    else:
+        entry.set("value", str(value))
+    return entry
+
+
+def apply_settings(config: ET.Element, changes: dict):
+    """Merge changes into a config element.
+
+    Existing entries keep their type. A dict is a nested config, a list is a
+    KNIME array, and {"@type": "xdouble", "value": "-Infinity"} forces a type.
+    """
+    for key, value in changes.items():
+        existing = next((c for c in config if c.get("key") == key), None)
+        position = list(config).index(existing) if existing is not None else len(config)
+        is_entry = existing is not None and existing.tag == f"{NS}entry"
+        if isinstance(value, dict) and "@type" in value:
+            replacement = xml_entry(key, value.get("value"), value["@type"])
+        elif isinstance(value, dict):
+            if existing is not None and not is_entry:
+                apply_settings(existing, value)
+                continue
+            replacement = ET.Element(f"{NS}config", {"key": key})
+            apply_settings(replacement, value)
+        elif isinstance(value, list):
+            old_types = [] if existing is None or is_entry else [
+                c.get("type") for c in existing if c.get("key") != "array-size"
+            ]
+            replacement = ET.Element(f"{NS}config", {"key": key})
+            replacement.append(xml_entry("array-size", len(value), "xint"))
+            for index, item in enumerate(value):
+                replacement.append(
+                    xml_entry(str(index), item, old_types[0] if old_types else None)
+                )
+        else:
+            replacement = xml_entry(key, value, existing.get("type") if is_entry else None)
+        if existing is not None:
+            config.remove(existing)
+        config.insert(position, replacement)
+
+
+def model_config(root: ET.Element) -> ET.Element:
+    model = next((c for c in root if c.get("key") == "model"), None)
+    if model is None:
+        raise ValueError("This node has no model settings")
+    return model
+
+
+async def find_item_path(gateway: Gateway, item_id: str, group: str = "root") -> Path | None:
+    """Find the workspace-relative path of a local space item."""
+    listing = await gateway.call(
+        "SpaceService.listWorkflowGroup", spaceProviderId="local", spaceId="local", itemId=group
+    )
+    for item in listing["items"]:
+        if item["id"] == item_id:
+            return Path(item["name"])
+        if item["type"] == "WorkflowGroup":
+            found = await find_item_path(gateway, item_id, item["id"])
+            if found is not None:
+                return Path(item["name"]) / found
+    return None
+
+
+async def project_item(gateway: Gateway, project: str) -> str:
+    state = await gateway.call("ApplicationService.getState")
+    for candidate in state.get("openProjects", []):
+        if candidate["projectId"] == project:
+            return candidate["origin"]["itemId"]
+    raise ValueError(f"Project {project} is not open")
+
+
+async def settings_file(gateway: Gateway, project: str, node_id: str) -> Path:
+    """Locate the saved settings.xml of a top-level node."""
+    relative = await find_item_path(gateway, await project_item(gateway, project))
+    if relative is None:
+        raise ValueError("Only workflows in the local space are supported")
+    workflow_dir = WORKSPACE / relative
+    number = node_id.split(":")[-1]
+    if node_id.count(":") > 1:
+        raise ValueError("Nodes inside metanodes or components are not supported")
+    for node in load(workflow_dir / "workflow.knime").get("nodes", {}).values():
+        if node.get("id") == number:
+            return workflow_dir / node["node_settings_file"]
+    raise ValueError(f"Node {node_id} is not saved yet. Call live_save first.")
+
+
+async def close_project(gateway: Gateway, project: str):
+    state = await gateway.call("ApplicationService.getState")
+    others = [p["projectId"] for p in state["openProjects"] if p["projectId"] != project]
+    following = json.dumps(others[0]) if others else "undefined"
+    await gateway.evaluate(
+        f"Promise.resolve(window.closeProject({json.dumps(project)}, {following}))"
+        ".then(() => null)"
+    )
+    for _ in range(40):
+        state = await gateway.call("ApplicationService.getState")
+        if project not in [p["projectId"] for p in state.get("openProjects", [])]:
+            return
+        await asyncio.sleep(0.25)
+    raise RuntimeError("Project did not close")
+
+
+@mcp.tool()
+async def live_get_node_settings(
+    node_id: str, project_id: str | None = None
+) -> dict:
+    """Return the saved model settings of any node, including Swing dialog nodes.
+
+    Reads settings.xml, so call live_save first to include recent changes.
+    """
+    async with Gateway() as gateway:
+        project = await gateway.project(project_id)
+        path = await settings_file(gateway, project, node_id)
+    return to_python(model_config(ET.parse(path).getroot()))
+
+
+@mcp.tool()
+async def live_set_node_settings(
+    node_id: str, settings: dict, replace: bool = False, project_id: str | None = None
+) -> dict:
+    """Change the model settings of any node, including Swing dialog nodes.
+
+    Use this for nodes that live_set_node_config refuses. It resets the node
+    and everything downstream, saves the project, closes it, edits settings.xml
+    and reopens it, so the undo history is lost and project_id changes. Use the
+    returned project_id afterwards. If KNIME rejects the settings, it shows a
+    dialog that the user must dismiss, and the original settings are restored.
+
+    Settings merge into the existing ones, or replace them all if replace is
+    true. A dict is a nested config and a list is a KNIME array. To force a
+    type, pass {"@type": "xdouble", "value": "-Infinity"}.
+    """
+    async with Gateway() as gateway:
+        project = await gateway.project(project_id)
+        workflow = await gateway.workflow(project, "root")
+        if node_id not in workflow["nodes"]:
+            raise ValueError(f"Node {node_id} not found")
+        states = node_states(workflow)
+        busy = [i for i, s in states.items() if s.get("state") in BUSY_STATES]
+        if busy:
+            raise RuntimeError(f"Nodes are still running: {busy}")
+        executed = states[node_id].get("state") == "EXECUTED"
+    if executed:
+        await change_states(project, "root", [node_id], "reset", 30)
+    async with Gateway() as gateway:
+        await save_project(gateway, project)
+        item = await project_item(gateway, project)
+        path = await settings_file(gateway, project, node_id)
+        original = path.read_bytes()
+        tree = ET.parse(path)
+        model = model_config(tree.getroot())
+        if replace:
+            for child in list(model):
+                model.remove(child)
+        apply_settings(model, settings)
+        await close_project(gateway, project)
+        try:
+            tree.write(path, encoding="UTF-8", xml_declaration=True)
+            reopened = await open_item(gateway, item)
+        except Exception as error:
+            path.write_bytes(original)
+            raise RuntimeError(
+                "KNIME did not reopen the workflow, so settings.xml was restored. It probably "
+                "rejected the settings and shows a Workflow Load dialog. Click OK there, close "
+                "the workflow without saving, and reopen it."
+            ) from error
+        await gateway.show(reopened["project_id"])
+        await asyncio.sleep(STORE_SYNC_SECONDS)
+        states = node_states(await gateway.workflow(reopened["project_id"], "root"))
+    return {
+        "project_id": reopened["project_id"],
+        "node": states.get(node_id),
+        "settings": to_python(model_config(ET.parse(path).getroot())),
+    }
+
+
 @mcp.tool()
 async def live_execute(
     node_ids: list[str] | None = None, timeout_seconds: int = 120,
@@ -537,19 +733,23 @@ async def live_read_table(
     }
 
 
+async def save_project(gateway: Gateway, project: str):
+    await gateway.evaluate(
+        f"Promise.resolve(window.saveProject({json.dumps(project)}, false)).then(() => null)"
+    )
+    for _ in range(60):
+        if not (await gateway.workflow(project, "root")).get("dirty"):
+            return
+        await asyncio.sleep(0.5)
+    raise RuntimeError("Save did not finish within 30 seconds")
+
+
 @mcp.tool()
 async def live_save(project_id: str | None = None) -> str:
     """Save a project to disk, overwriting the saved version."""
     async with Gateway() as gateway:
-        project = await gateway.project(project_id)
-        await gateway.evaluate(
-            f"Promise.resolve(window.saveProject({json.dumps(project)}, false)).then(() => null)"
-        )
-        for _ in range(60):
-            if not (await gateway.workflow(project, "root")).get("dirty"):
-                return "saved"
-            await asyncio.sleep(0.5)
-    raise RuntimeError("Save did not finish within 30 seconds")
+        await save_project(gateway, await gateway.project(project_id))
+    return "saved"
 
 
 if __name__ == "__main__":

@@ -92,6 +92,8 @@ To make this permanent, add this line after `-vmargs` in `knime.ini`:
 | `live_delete` | Delete nodes or connections |
 | `live_get_node_config` | Read node settings and their JSON schema |
 | `live_set_node_config` | Change node settings |
+| `live_get_node_settings` | Read saved settings of any node, including Swing dialogs |
+| `live_set_node_settings` | Change settings of any node, including Swing dialogs |
 | `live_execute` | Execute nodes and wait for the result |
 | `live_reset` | Reset nodes |
 | `live_read_table` | Read rows from an output table |
@@ -105,9 +107,14 @@ To make this permanent, add this line after `-vmargs` in `knime.ini`:
 
 ## Limitations
 
-- **Older node dialogs:** `live_get_node_config` and `live_set_node_config` only
-  work on nodes with a web dialog. Nodes with a Swing dialog, such as Numeric
-  Binner, return an error and must be configured in KNIME.
+- **Swing dialog nodes:** `live_get_node_config` and `live_set_node_config` only
+  work on web dialogs. For nodes with a Swing dialog, such as Numeric Binner,
+  use `live_get_node_settings` and `live_set_node_settings`. These edit
+  `settings.xml`, so they need the setting names used in that file. They reset
+  the node and everything downstream, save and reopen the workflow, clear its
+  undo history and change its `project_id`. They only work on top-level nodes.
+  If KNIME rejects the settings, it shows a Workflow Load dialog that you must
+  dismiss yourself. The original `settings.xml` is then restored.
 - **Table values:** `live_read_table` returns values as KNIME displays them, so
   numbers can be rounded.
 - **Local space only:** the live tools do not open workflows from a Hub.
@@ -134,7 +141,7 @@ that matters, and review tool calls before you approve them.
 | `KNIME is not reachable on port 9222` | Start KNIME with the debug port and check `KNIME_DEBUG_PORT` |
 | `KNIME UI page not found` | Wait until KNIME has finished starting |
 | `Pass project_id` | Several workflows are open: choose one from the list in the message |
-| `Only web dialogs can be read or changed` | Configure this node in KNIME |
+| `Use live_get_node_settings and live_set_node_settings instead` | The node has a Swing dialog: use those tools |
 
 ## License
 
