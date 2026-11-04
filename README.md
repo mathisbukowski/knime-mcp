@@ -113,7 +113,6 @@ To make this permanent, add this line after `-vmargs` in `knime.ini`:
 - **Local space only:** the live tools do not open workflows from a Hub.
 - **Metanodes and components:** pass the node id as `workflow_id` to work inside
   one. This has not been tested.
-- **`live_open_workflow`:** this tool has not been tested yet.
 - **Saved state:** the file tools see the last save, not unsaved changes.
 
 ## Security
